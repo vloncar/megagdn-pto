@@ -52,7 +52,13 @@ if [ -n "${KIMI_V19_HOOK:-}" ]; then
     )
 fi
 
-docker run -it --rm --privileged --network=host --ipc=host --shm-size=32g \
+# Allocate a TTY only when run interactively, so background/CI runs work too.
+TTY_FLAGS=()
+if [ -t 0 ]; then
+    TTY_FLAGS=(-it)
+fi
+
+docker run "${TTY_FLAGS[@]}" --rm --privileged --network=host --ipc=host --shm-size=32g \
     "${DEVICES[@]}" \
     "${MOUNTS[@]}" \
     -e ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
