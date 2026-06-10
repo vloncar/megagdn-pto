@@ -265,7 +265,11 @@ def apply_kda_patch() -> None:
         def _dbg_recurrent(*a, **kw):
             if not _seen["n"]:
                 _seen["n"] = True
-                print("[KDA-DBG] fused_recurrent_kda called", file=sys.stderr, flush=True)
+                try:
+                    with open("/sources/.kda_recurrent_called", "a") as f:
+                        f.write(f"pid={os.getpid()}\n")
+                except OSError:
+                    pass
             return _orig_rec(*a, **kw)
 
         _kda_mod.fused_recurrent_kda = _dbg_recurrent
