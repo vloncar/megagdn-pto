@@ -58,7 +58,8 @@ MODEL_QUANT=(
     [qwen36_27b_w8a8]="ascend"
     [qwen36_35b_a3b_w8a8]="ascend"
 )
-MODELS="${MODELS:-qwen35_0_8b qwen35_9b qwen36_27b_w8a8 qwen36_35b_a3b_w8a8}"
+MODELS="${MODELS:-qwen35_0_8b}"
+#MODELS="${MODELS:-qwen35_0_8b qwen35_9b qwen36_27b_w8a8 qwen36_35b_a3b_w8a8}"
 WITH_PTO_STAGED="${WITH_PTO_STAGED:-0}"
 
 mkdir -p "$OUT_DIR"
