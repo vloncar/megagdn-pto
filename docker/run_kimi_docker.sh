@@ -3,6 +3,10 @@
 #
 # Env:
 #   KIMI_IMAGE       — override image (default v0.18.0rc1)
+#   KIMI_MODEL_DIR   — host path to model weights (default /scratch); mounted
+#                      read-only at /scratch inside the container, so the
+#                      hardcoded /scratch/model_weights/... preset paths still
+#                      resolve regardless of the host location
 #   KIMI_NO_MOUNTS=1 — skip the v0.18-specific file overrides (use for v0.19+)
 #
 # v0.18 mounts (vendored upstream overrides in docker/overrides/):
@@ -18,8 +22,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${KIMI_IMAGE:-quay.io/ascend/vllm-ascend:v0.18.0rc1}"
+MODEL_DIR="${KIMI_MODEL_DIR:-/scratch}"
 
 # Ascend devices for TP=4 (NPUs 0-3)
 DEVICES=(
@@ -36,7 +41,7 @@ MOUNTS=(
     -v /etc/ascend_install.info:/etc/ascend_install.info:ro
     -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware
     -v /var/queue_schedule:/var/queue_schedule
-    -v /scratch:/scratch:ro
+    -v "${MODEL_DIR}:/scratch:ro"
     -v "${REPO_ROOT}:/sources"
 )
 if [ -z "${KIMI_NO_MOUNTS:-}" ]; then
