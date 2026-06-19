@@ -113,8 +113,11 @@ Or:
 ```bash
 # v0.19 image instead of the default v0.18:
 KIMI_IMAGE=quay.io/ascend/vllm-ascend:v0.19.1rc1 KIMI_NO_MOUNTS=1 KIMI_V19_HOOK=1 \
-    bash docker/run_kimi_docker.sh python benchmarks/eval_acc/run_lm_eval.py \
-    --preset kimi_linear_48b --backend kda_mega
+    bash docker/run_kimi_docker.sh bash -c "export PIP_CACHE_DIR=/sources/.pip-cache && \
+    pip install -q lm_eval && \
+    python benchmarks/eval_acc/run_lm_eval.py \
+    --preset kimi_linear_48b --backend kda_mega \
+    --output-json outputs/data/eval_kimi/kimi_linear_48b_kda.json"
 ```
 
 ## Generating figures
