@@ -67,6 +67,19 @@ using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor,
                        RV, CV, pto::SLayout::NoneBox, 512, P>;
 #endif
 
+// Cast g fp16 → fp32 in UB (accumulate in fp32 to match the reference).
+// Reads ChunkSize×CTC half values at halfAddr, writes fp32 at ubAddr.
+template <int32_t ChunkSize, int32_t CTC>
+AICORE void cast_g_fp16_to_fp32(int32_t halfAddr, int32_t ubAddr)
+{
+  UbND<half, ChunkSize, CTC> g_h;
+  TASSIGN(g_h, halfAddr);
+  UbND<float, ChunkSize, CTC> g_f;
+  TASSIGN(g_f, ubAddr);
+  TCVT(g_f, g_h, pto::RoundMode::CAST_NONE);
+  pipe_barrier(PIPE_V);
+}
+
 template <int32_t NumHeads, int32_t KDim, int32_t ChunkSize>
 AICORE void gate_cumsum_kda_kernel(
     __gm__ half *g_ptr, __gm__ float *g_sum_ptr,
@@ -169,15 +182,7 @@ AICORE void gate_cumsum_kda_kernel(
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-        // Cast g fp16 → fp32 (accumulate in fp32 to match the fp64 reference).
-        {
-          UbND<half, ChunkSize, CTC> g_h;
-          TASSIGN(g_h, GHalfAddr);
-          UbND<float, ChunkSize, CTC> g_f;
-          TASSIGN(g_f, GUbAddr);
-          TCVT(g_f, g_h, pto::RoundMode::CAST_NONE);
-          pipe_barrier(PIPE_V);
-        }
+        cast_g_fp16_to_fp32<ChunkSize, CTC>(GHalfAddr, GUbAddr);
 
         // ── Vec: prefix sum (all ColTile cols in parallel) ───────────────
         // Row 0: acc = g[0]; g_sum[0] = acc
@@ -277,15 +282,7 @@ AICORE void gate_cumsum_kda_kernel(
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-            // Cast g fp16 → fp32 (accumulate in fp32 to match the reference).
-            {
-              UbND<half, ChunkSize, CTC> g_h;
-              TASSIGN(g_h, GHalfAddr);
-              UbND<float, ChunkSize, CTC> g_f;
-              TASSIGN(g_f, GUbAddr);
-              TCVT(g_f, g_h, pto::RoundMode::CAST_NONE);
-              pipe_barrier(PIPE_V);
-            }
+            cast_g_fp16_to_fp32<ChunkSize, CTC>(GHalfAddr, GUbAddr);
 
             UbND<float, 1, CTC> g_row_0;
             TASSIGN(g_row_0, GUbAddr);
