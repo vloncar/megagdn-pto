@@ -35,8 +35,8 @@ from megagdn_pto.kernel_libs import (
     transpose_beta,
     transpose_gates,
 )
-from tests.utils import NumericalAccuracy, generate_random_inputs
 from tests.ref_gdn import RefGDN
+from tests.utils import NumericalAccuracy, generate_random_inputs
 
 ACCURACY = NumericalAccuracy()
 
@@ -44,6 +44,7 @@ C = 128  # PTO chunk size
 D = 128  # head dimension
 
 torch.manual_seed(42)
+
 
 # ---------------------------------------------------------------------------
 # Test cases
@@ -123,7 +124,6 @@ def build_test_cases() -> list[TestCase]:
 
 def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -141,7 +141,7 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     g_t, beta_t = transpose_gates(g_sum_npu), transpose_beta(beta_npu)
     mask = torch.tril(torch.ones(C, C, device=dev, dtype=torch.float32), diagonal=-1)
     A_out = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
-    stream = torch.npu.current_stream()._as_parameter_
+
     torch.npu.synchronize()
     run_scaled_dot_kkt(
         k_npu,
@@ -149,7 +149,6 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         g_sum_npu,
         mask,
         A_out,
-        stream=stream,
         g_t=g_t,
         beta_t=beta_t,
         chunk_size=C,
@@ -159,13 +158,11 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     )
     torch.npu.synchronize()
     ref = tc.ref_gdn.kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
-
     return ACCURACY.stats_ok(A_out.cpu().to(tc.dtype), ref.to(tc.dtype), chunk_size=C)
 
 
 def test_solve_tril(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -185,7 +182,6 @@ def test_solve_tril(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
 
 def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -197,14 +193,13 @@ def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     g_sum = tc.ref_gdn.cumsum(g_in.cpu(), C, tc.cu_seqlens_list)
     A = tc.ref_gdn.kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
     A_inv = tc.ref_gdn.solve_tril(A, C, tc.cu_seqlens_list)
-    stream = torch.npu.current_stream()._as_parameter_
 
     k_npu, v_npu, beta_npu, g_sum_npu, A_inv_npu = (
-        k.to(torch.float16).npu(),
-        v.to(torch.float16).npu(),
-        beta.to(torch.float16).npu(),
-        g_sum.to(torch.float32).npu(),
-        A_inv.to(torch.float16).npu(),
+        k.to(torch.float16).to(dev),
+        v.to(torch.float16).to(dev),
+        beta.to(torch.float16).to(dev),
+        g_sum.to(torch.float32).to(dev),
+        A_inv.to(torch.float16).to(dev),
     )
     g_t, beta_t = transpose_gates(g_sum_npu), transpose_beta(beta_npu)
     w_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
@@ -218,7 +213,6 @@ def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         A_inv_npu,
         w_out,
         u_out,
-        stream=stream,
         g_t=g_t,
         beta_t=beta_t,
         chunk_size=C,
@@ -235,7 +229,6 @@ def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
 
 def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -248,20 +241,21 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     A = tc.ref_gdn.kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
     A_inv = tc.ref_gdn.solve_tril(A, C, tc.cu_seqlens_list)
     w, u = tc.ref_gdn.wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
-    stream = torch.npu.current_stream()._as_parameter_
+    h0 = (0.01 * torch.randn(N_seq, H, D, D, dtype=torch.float16)).contiguous()
 
-    k_npu, g_sum_npu, w_npu, u_npu = (
-        k.to(torch.float16).npu(),
-        g_sum.to(torch.float32).npu(),
-        w.to(torch.float16).npu(),
-        u.to(torch.float16).npu(),
+    k_npu, g_sum_npu, w_npu, u_npu, h0_npu = (
+        k.to(torch.float16).to(dev),
+        g_sum.to(torch.float32).to(dev),
+        w.to(torch.float16).to(dev),
+        u.to(torch.float16).to(dev),
+        h0.to(dev),
     )
     g_t = transpose_gates(g_sum_npu)
 
     tc_n = total_chunks(N_seq, T, C, cu)
     h_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
-    fs_out = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
+    fs_out = torch.zeros(N_seq, H, D, D, device=dev, dtype=torch.float16)
     run_chunk_h(
         k_npu,
         w_npu,
@@ -270,27 +264,35 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         h_out,
         v_out,
         fs_out,
-        stream=stream,
         g_t=g_t,
         chunk_size=C,
         cu_seqlens=cu,
         batch_size_override=N_seq,
         key_heads=HG,
+        initial_state=h0_npu,
     )
     torch.npu.synchronize()
-    h_ref, v_ref, _ = tc.ref_gdn.chunk_h(
-        k, w.to(torch.float16), u.to(torch.float16), g_sum, C, tc.cu_seqlens_list
+    h_ref, v_ref, fs_ref = tc.ref_gdn.chunk_h(
+        k,
+        w.to(torch.float16),
+        u.to(torch.float16),
+        g_sum,
+        C,
+        tc.cu_seqlens_list,
+        initial_state=h0,
     )
     ok_h = ACCURACY.stats_ok(
-        h_out.cpu().to(tc.dtype).view(tc_n, H, D, D), h_ref.to(tc.dtype), chunk_size=C
+        h_out.cpu().to(tc.dtype).view(tc_n, H, D, D),
+        h_ref.to(tc.dtype),
+        chunk_size=C,
     )
     ok_v = ACCURACY.stats_ok(v_out.cpu().to(tc.dtype), v_ref.to(tc.dtype), chunk_size=C)
-    return ok_h and ok_v
+    ok_fs = ACCURACY.stats_ok(fs_out.cpu().to(tc.dtype), fs_ref.to(tc.dtype), chunk_size=C)
+    return ok_h and ok_v and ok_fs
 
 
 def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -305,14 +307,12 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     w, u = tc.ref_gdn.wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
     h_states, v_new, _ = tc.ref_gdn.chunk_h(k, w, u, g_sum, C, tc.cu_seqlens_list)
 
-    stream = torch.npu.current_stream()._as_parameter_
-
     q_npu, k_npu, g_sum_npu, v_new_npu, h_states_npu = (
-        q.to(torch.float16).npu(),
-        k.to(torch.float16).npu(),
-        g_sum.to(torch.float32).npu(),
-        v_new.to(torch.float16).npu(),
-        h_states.to(torch.float16).npu(),
+        q.to(torch.float16).to(dev),
+        k.to(torch.float16).to(dev),
+        g_sum.to(torch.float32).to(dev),
+        v_new.to(torch.float16).to(dev),
+        h_states.to(torch.float16).to(dev),
     )
 
     o_ref = tc.ref_gdn.chunk_o(
@@ -335,7 +335,6 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         g_sum_npu,
         mask_npu,
         o_out,
-        stream=stream,
         g_t=g_t,
         chunk_size=C,
         cu_seqlens=cu,
@@ -349,7 +348,6 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
 
 def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -359,10 +357,7 @@ def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
 
     g = torch.randn(1, T, H, device=dev, dtype=torch.float32)
     g_sum = torch.empty_like(g)
-    stream = torch.npu.current_stream()._as_parameter_
-    run_chunk_cumsum(
-        g, g_sum, stream=stream, chunk_size=C, cu_seqlens=cu, batch_size_override=N_seq
-    )
+    run_chunk_cumsum(g, g_sum, chunk_size=C, cu_seqlens=cu, batch_size_override=N_seq)
     torch.npu.synchronize()
     ref = tc.ref_gdn.cumsum(g.cpu(), C, tc.cu_seqlens_list)
     return ACCURACY.stats_ok(g_sum.cpu().to(tc.dtype), ref.to(tc.dtype))
@@ -378,6 +373,29 @@ _STAGES = {
 }
 
 
+DEFAULT_HEAD_CONFIGS = [
+    (16, 4),
+    (16, 16),
+    (24, 8),
+    (32, 8),
+    (48, 16),
+    (64, 16),
+]
+
+
+def _parse_head_configs(raw: str | None, h_list: str, hg: int) -> list[tuple[int, int]]:
+    if raw:
+        configs: list[tuple[int, int]] = []
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            h_s, hg_s = item.split(":", 1)
+            configs.append((int(h_s), int(hg_s)))
+        return configs
+    return [(int(x), hg) for x in h_list.split(",") if x.strip()]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default=os.getenv("GDN_NPU_DEVICE", "npu:0"))
@@ -388,6 +406,11 @@ def main() -> None:
         "--H-list", default="16,32,48,64", help="Comma-separated value head counts."
     )
     parser.add_argument("--hg", type=int, default=16, help="Key head count Hg.")
+    parser.add_argument(
+        "--head-configs",
+        default=None,
+        help="Comma-separated H:Hg pairs. Overrides --H-list/--hg when set.",
+    )
     parser.add_argument(
         "--stage",
         default="cumsum,kkt,solve_tril,chunk_h,wy_fast,chunk_o",
@@ -402,20 +425,25 @@ def main() -> None:
 
     torch.npu.set_device(args.device)
     dev = torch.device(args.device)
-    heads_list = [int(x) for x in args.H_list.split(",") if x.strip()]
-    HG = args.hg
+    default_heads = args.H_list == "16,32,48,64" and args.hg == 16
+    head_configs = (
+        DEFAULT_HEAD_CONFIGS
+        if args.head_configs is None and default_heads
+        else _parse_head_configs(args.head_configs, args.H_list, args.hg)
+    )
 
     cases = [TestCase("quick T=128", None, 128)] if args.quick else build_test_cases()
 
     print(
-        f"Device: {args.device}  stages={stages}  H={heads_list}  Hg={HG}  D={D}  C={C}"
+        f"Device: {args.device}  stages={stages}  head_configs={head_configs}  "
+        f"D={D}  C={C}"
     )
     all_pass = True
 
     for stage in stages:
         name, fn = _STAGES[stage]
         print(f"\n{'=' * 60}\nStage: {name}\n{'=' * 60}")
-        for H in heads_list:
+        for H, HG in head_configs:
             assert H % HG == 0, f"H={H} must be divisible by Hg={HG}"
             print(f"\n  H={H} (Hg={HG})")
             for i, tc in enumerate(cases):

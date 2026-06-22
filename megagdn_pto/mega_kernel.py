@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import ctypes
 import os
-from functools import lru_cache
 
 import torch
 
 from megagdn_pto.compile import BLOCK_DIM, _KERNELS_PTO, compile_mega_kernel
 from megagdn_pto.kernel_libs import (
+    _check_supported_heads,
     chunk_gdn_causal_masks,
     precomputed_minus_identity,
     total_chunks,
@@ -25,26 +25,24 @@ from megagdn_pto.kernel_libs import (
 )
 
 
-@lru_cache(maxsize=None)
 def _load_mega_kernel(
     *,
-    num_heads: int,
-    key_heads: int | None = None,
     hidden_size: int = 128,
     chunk_size: int = 128,
+    cpp_mtime_ns: int,
 ) -> ctypes.CDLL:
-    mtime = os.stat(os.path.join(_KERNELS_PTO, "mega_kernel.cpp")).st_mtime_ns
     lib_path = compile_mega_kernel(
-        num_heads=num_heads,
-        key_heads=key_heads,
         hidden_size=hidden_size,
         chunk_size=chunk_size,
-        cpp_mtime_ns=mtime,
+        cpp_mtime_ns=cpp_mtime_ns,
     )
     lib = ctypes.CDLL(os.path.abspath(lib_path))
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
-        + [ctypes.c_void_p] * 28
+        + [ctypes.c_void_p] * 22
+        + [ctypes.c_int64]
+        + [ctypes.c_void_p] * 7
+        + [ctypes.c_uint32, ctypes.c_uint32]
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
@@ -59,11 +57,11 @@ def run_mega_kernel(
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor,
     *,
-    stream,
     chunk_size: int = 128,
     scale: float = 1.0,
     block_dim: int | None = None,
     key_heads: int | None = None,
+    initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run all seven GDN stages in a single fused NPU kernel launch.
@@ -74,11 +72,11 @@ def run_mega_kernel(
         g_in:             ``[B, T, H]`` float32 pre-cumsum gate logits.
         beta:             ``[B, T, H]`` fp16 gate bias.
         cu_seqlens:       ``int32`` cumulative sequence lengths ``[0, ..., T]``.
-        stream:           NPU stream handle.
         chunk_size:       Chunk size C (default 128).
         scale:            Output scale factor (typically ``head_dim ** -0.5``).
         block_dim:        AI-Core block count (auto-detected if None).
         key_heads:        Number of Q/K heads Hg (inferred from ``q`` if None).
+        initial_state:    Optional ``[N_seq, H, D, D]`` initial recurrent state.
         return_final_state: If True, also return ``[N_seq, H, D, D]`` final states.
 
     Returns:
@@ -86,8 +84,9 @@ def run_mega_kernel(
         recurrent state ``[N_seq, H, D, D]`` fp16.
     """
     dev = q.device
-    kh = key_heads if key_heads is not None else q.shape[2]
     H, D = v.shape[2], q.shape[3]
+    kh = key_heads if key_heads is not None else q.shape[2]
+    _check_supported_heads(H, kh)
     C = chunk_size
     T = q.shape[1]
     N_seq = int(cu_seqlens.numel()) - 1
@@ -114,6 +113,12 @@ def run_mega_kernel(
     s        = torch.zeros(tc * H, D, D, device=dev, dtype=torch.float16)
     v_new    = torch.empty_like(v)
     fs       = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
+    if initial_state is None:
+        h0 = None
+        has_initial_state = 0
+    else:
+        h0 = initial_state.to(device=dev, dtype=torch.float16).contiguous()
+        has_initial_state = 1
 
     kkt_ws    = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float16)
     wy_ws_a1  = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
@@ -124,7 +129,10 @@ def run_mega_kernel(
     o_ws_gated = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     o_out     = torch.empty_like(v)
 
-    lib = _load_mega_kernel(num_heads=H, key_heads=kh, hidden_size=D, chunk_size=C)
+    mtime = os.stat(os.path.join(_KERNELS_PTO, "mega_kernel.cpp")).st_mtime_ns
+    lib = _load_mega_kernel(hidden_size=D, chunk_size=C, cpp_mtime_ns=mtime)
+    # empty the torch_npu taskqueue:
+    stream = torch.npu.current_stream()._as_parameter_
     lib.call_kernel(
         bd, stream,
         _vp(q), _vp(k), _vp(v), _vp(g_in), _vp(beta),
@@ -133,12 +141,15 @@ def run_mega_kernel(
         _vp(g_sum), _vp(g_t), _vp(beta_t),
         _vp(A), _vp(A_inv_f32), _vp(A_inv),
         _vp(w), _vp(u), _vp(s), _vp(v_new), _vp(fs),
+        _vp(h0), has_initial_state,
         _vp(kkt_ws), _vp(wy_ws_a1), _vp(wy_ws_a2), _vp(h_ws),
         _vp(o_ws_qk), _vp(o_ws_qs), _vp(o_ws_gated),
+        H, kh,
         N_seq, T, T, num_matrices,
     )
 
     o_scaled = o_out * scale
     if return_final_state:
-        return o_scaled, fs.view(N_seq, H, D, D)
+        fs_view = fs.view(N_seq, H, D, D)
+        return o_scaled, fs_view
     return o_scaled

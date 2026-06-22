@@ -2,8 +2,8 @@
 """End-to-end accuracy test: full PTO pipeline vs CPU fp32 reference and Triton.
 
 Tests the complete GDN pipeline for all input shapes:
-  PTO:    cumsum → scaled_dot_kkt → solve_tril → wy_fast → chunk_h → chunk_o (C=128)
-  Triton: cumsum → kkt → solve_tril → wy_fast → chunk_h → chunk_o (C=64, bf16)
+  PTO:    cumsum -> scaled_dot_kkt -> solve_tril -> wy_fast -> chunk_h -> chunk_o (C=128)
+  Triton: cumsum -> kkt -> solve_tril -> wy_fast -> chunk_h -> chunk_o (C=64, bf16)
 
 Both are checked against an independent CPU fp32 reference pipeline.
 PTO and Triton outputs are also compared pairwise.
@@ -36,7 +36,6 @@ if _TRITON_BASELINE not in sys.path:
 
 from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
 from megagdn_pto.kernel_libs import (
-    BLOCK_DIM,
     run_chunk_cumsum,
     run_chunk_h,
     run_chunk_o,
@@ -46,8 +45,8 @@ from megagdn_pto.kernel_libs import (
     transpose_beta,
     transpose_gates,
 )
-from tests.ref_gdn import RefGDN
 from megagdn_pto.mega_kernel import run_mega_kernel
+from tests.ref_gdn import RefGDN
 from tests.utils import NumericalAccuracy
 
 C_PTO = 128
@@ -67,13 +66,24 @@ ACCURACY = NumericalAccuracy()
 # ---------------------------------------------------------------------------
 
 
-def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None):
+def pto_pipeline(
+    q,
+    k,
+    v,
+    g_in,
+    beta,
+    cu32,
+    H,
+    Hg,
+    scale=1.0,
+    tri_inv_func=None,
+    initial_state=None,
+    return_final_state=False,
+):
     """Full six-stage PTO pipeline on NPU."""
     dev = q.device
     T = q.shape[1]
     N_seq = int(cu32.numel()) - 1
-    cu_cpu = cu32.cpu().tolist()
-    stream = torch.npu.current_stream()._as_parameter_
 
     if tri_inv_func is None:
         tri_inv_func = load_tri_inverse()
@@ -83,7 +93,6 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     run_chunk_cumsum(
         g_in,
         g_sum,
-        stream=stream,
         chunk_size=C_PTO,
         cu_seqlens=cu32,
         batch_size_override=N_seq,
@@ -100,7 +109,6 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
         g_sum,
         msk_lower,
         A,
-        stream=stream,
         g_t=g_t,
         beta_t=beta_t,
         chunk_size=C_PTO,
@@ -123,7 +131,6 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
         A_inv,
         w,
         u,
-        stream=stream,
         g_t=g_t,
         beta_t=beta_t,
         chunk_size=C_PTO,
@@ -136,7 +143,11 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     tc_n = total_chunks(N_seq, T, C_PTO, cu32)
     s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_new = torch.empty_like(v)
-    fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
+    fs = (
+        torch.zeros(N_seq, H, D, D, device=dev, dtype=torch.float16)
+        if return_final_state
+        else None
+    )
     run_chunk_h(
         k,
         w,
@@ -145,12 +156,12 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
         s,
         v_new,
         fs,
-        stream=stream,
         g_t=g_t,
         chunk_size=C_PTO,
         cu_seqlens=cu32,
         batch_size_override=N_seq,
         key_heads=Hg,
+        initial_state=initial_state,
     )
 
     # 6. chunk_o
@@ -164,7 +175,6 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
         g_sum,
         msk_full,
         o,
-        stream=stream,
         g_t=g_t,
         chunk_size=C_PTO,
         cu_seqlens=cu32,
@@ -172,7 +182,8 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
         key_heads=Hg,
     )
 
-    return (o * scale).to(q.dtype)
+    out = (o * scale).to(q.dtype)
+    return (out, fs) if return_final_state else out
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +200,12 @@ def _triton_available() -> bool:
         return False
 
 
-def triton_pipeline(q, k, v, g_in, beta, cu_long, H, Hg, scale=1.0):
+def triton_pipeline(q, k, v, g_in, beta, cu_long, H, Hg, scale=1.0, initial_state=None):
     """Full six-stage Triton pipeline (C=64, bf16)."""
     from fla_vendor.chunk import chunk_gated_delta_rule_fwd
 
     _, o_tri, _, _, _, _, _ = chunk_gated_delta_rule_fwd(
-        q, k, v, g_in, beta, scale, None, None, cu_long
+        q, k, v, g_in, beta, scale, initial_state, False, cu_long
     )
     torch.npu.synchronize()
     return o_tri.float()
@@ -220,6 +231,54 @@ def cross_ok(pto: torch.Tensor, triton: torch.Tensor) -> bool:
     ratio = rmse / max(mean_abs, 1e-15)
     r2 = _r2(triton, pto)
     return ratio <= MAX_RMSE_CROSS and r2 >= MIN_R2_CROSS
+
+
+def _format_compare(name: str, actual: torch.Tensor, expected: torch.Tensor, ok: bool) -> str:
+    diff = (actual - expected).abs()
+    flat_diff = diff.flatten()
+    max_pos = int(flat_diff.argmax().item())
+    max_idx = tuple(int(i) for i in np.unravel_index(max_pos, tuple(diff.shape)))
+    max_abs = float(flat_diff[max_pos])
+    mean_abs = float(expected.float().flatten().abs().mean())
+    rmse = float(torch.sqrt((diff.float().flatten() ** 2).mean()))
+    ratio = rmse / max(mean_abs, 1e-15)
+    r2 = _r2(expected, actual)
+    return (
+        f"    {name}={'PASS' if ok else 'FAIL'}"
+        f" max_abs={max_abs:.4e}"
+        f" rmse={rmse:.4e}"
+        f" rmse/mean_ref_abs={ratio:.4e}"
+        f" r2={r2:.8f}"
+        f" max_idx={max_idx}"
+        f" actual={float(actual.flatten()[max_pos]):.4e}"
+        f" expected={float(expected.flatten()[max_pos]):.4e}"
+    )
+
+
+def _failure_details(
+    label: str,
+    *,
+    pto_output: tuple[torch.Tensor, torch.Tensor, bool],
+    pto_final_state: tuple[torch.Tensor, torch.Tensor, bool],
+    mega_output: tuple[torch.Tensor, torch.Tensor, bool],
+    mega_final_state: tuple[torch.Tensor, torch.Tensor, bool],
+    cross_output: tuple[torch.Tensor, torch.Tensor, bool] | None,
+) -> list[str]:
+    lines = [f"    [details for {label}]"]
+    for name, item in (
+        ("pto.output", pto_output),
+        ("pto.final_state", pto_final_state),
+        ("mega.output", mega_output),
+        ("mega.final_state", mega_final_state),
+    ):
+        actual, expected, ok = item
+        if not ok:
+            lines.append(_format_compare(name, actual, expected, ok))
+    if cross_output is not None:
+        actual, expected, ok = cross_output
+        if not ok:
+            lines.append(_format_compare("cross.output", actual, expected, ok))
+    return lines if len(lines) > 1 else []
 
 
 # ---------------------------------------------------------------------------
@@ -261,13 +320,27 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
         else torch.tensor([0, T], dtype=torch.int32, device=dev)
     )
     cu_cpu = cu32.cpu().tolist() if cu_list else None
+    h0 = (0.01 * torch.randn(N_seq, H, D, D, device=dev, dtype=torch.float16)).contiguous()
 
     # PTO pipeline
-    o_pto = pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale, tri_inv_func)
+    o_pto, fs_pto = pto_pipeline(
+        q,
+        k,
+        v,
+        g_in,
+        beta,
+        cu32,
+        H,
+        Hg,
+        scale,
+        tri_inv_func,
+        initial_state=h0,
+        return_final_state=True,
+    )
 
     # CPU reference pipeline
     cpu_ref_gdn = RefGDN(torch.double)
-    o_cpu = cpu_ref_gdn.run_full_pipeline(
+    o_cpu, fs_cpu = cpu_ref_gdn.run_full_pipeline(
         q.cpu(),
         k.cpu(),
         v.cpu(),
@@ -277,36 +350,66 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
         H,
         Hg,
         scale,
+        initial_state=h0.cpu(),
+        return_final_state=True,
     )
 
     # PTO mega kernel
-    o_mega = run_mega_kernel(
+    o_mega, fs_mega = run_mega_kernel(
         q,
         k,
         v,
         g_in,
         beta,
         cu32,
-        stream=torch.npu.current_stream()._as_parameter_,
         chunk_size=C_PTO,
         scale=scale,
         key_heads=Hg,
+        initial_state=h0,
+        return_final_state=True,
     )
 
-    ok_pto = ACCURACY.stats_ok(o_pto.double().cpu(), o_cpu.double())
-    ok_mega = ACCURACY.stats_ok(o_mega.double().cpu(), o_cpu.double())
+    o_pto_cpu = o_pto.double().cpu()
+    fs_pto_cpu = fs_pto.double().cpu()
+    o_mega_cpu = o_mega.double().cpu()
+    fs_mega_cpu = fs_mega.double().cpu()
+    o_cpu = o_cpu.double()
+    fs_cpu = fs_cpu.double()
+
+    ok_pto_output = ACCURACY.stats_ok(o_pto_cpu, o_cpu)
+    ok_pto_final_state = ACCURACY.stats_ok(fs_pto_cpu, fs_cpu)
+    ok_mega_output = ACCURACY.stats_ok(o_mega_cpu, o_cpu)
+    ok_mega_final_state = ACCURACY.stats_ok(fs_mega_cpu, fs_cpu)
+    ok_pto = ok_pto_output and ok_pto_final_state
+    ok_mega = ok_mega_output and ok_mega_final_state
 
     ok_cross = True
+    cross_debug = None
     if triton_ok:
         try:
             cu_long = cu32.long()
-            o_tri = triton_pipeline(q, k, v, g_in, beta, cu_long, H, Hg, scale)
-            ok_cross = cross_ok(o_pto.float().cpu(), o_tri.cpu())
+            o_tri = triton_pipeline(
+                q, k, v, g_in, beta, cu_long, H, Hg, scale, initial_state=h0
+            )
+            o_tri_cpu = o_tri.double().cpu()
+            ok_cross = cross_ok(o_pto_cpu.float(), o_tri_cpu.float())
+            cross_debug = (o_pto_cpu, o_tri_cpu, ok_cross)
         except Exception as e:
             print(f"    [Triton skipped: {str(e).split(chr(10))[0][:80]}]")
             ok_cross = True  # not a failure, triton may not support all shapes
 
-    return (ok_pto and ok_cross and ok_mega), label, ok_pto, ok_cross, ok_mega
+    failure_details = []
+    if not (ok_pto and ok_cross and ok_mega):
+        failure_details = _failure_details(
+            label,
+            pto_output=(o_pto_cpu, o_cpu, ok_pto_output),
+            pto_final_state=(fs_pto_cpu, fs_cpu, ok_pto_final_state),
+            mega_output=(o_mega_cpu, o_cpu, ok_mega_output),
+            mega_final_state=(fs_mega_cpu, fs_cpu, ok_mega_final_state),
+            cross_output=cross_debug,
+        )
+
+    return ok_pto and ok_cross and ok_mega, label, ok_pto, ok_cross, ok_mega, failure_details
 
 
 def main() -> None:
@@ -334,7 +437,7 @@ def main() -> None:
         assert H % Hg == 0
         print(f"\n{'='*60}\nH={H}  Hg={Hg}\n{'='*60}")
         for T_or_cu, T_total in TEST_SHAPES:
-            ok, label, ok_pto, ok_cross, ok_mega = run_one(
+            ok, label, ok_pto, ok_cross, ok_mega, failure_details = run_one(
                 T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok
             )
             if not ok:
@@ -342,8 +445,11 @@ def main() -> None:
             cross_str = f"  cross={'PASS' if ok_cross else 'FAIL'}" if triton_ok else ""
             status = "PASS" if ok else "FAIL"
             print(
-                f"  {status}  {label}  pto_vs_cpu={'PASS' if ok_pto else 'FAIL'}  mega_vs_cpu={'PASS' if ok_mega else 'FAIL'}{cross_str}"
+                f"  {status}  {label}  pto_vs_cpu={'PASS' if ok_pto else 'FAIL'}  "
+                f"mega_vs_cpu={'PASS' if ok_mega else 'FAIL'}{cross_str}"
             )
+            for line in failure_details:
+                print(line)
 
     print(f"\n{'ALL PASS' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)

@@ -36,6 +36,7 @@
 //   S  [total_chunks, H, D, D] half — per-chunk state snapshots (output)
 //   V  [total_tokens, H, D]  half   — residual-corrected values (output)
 //   FS [batch, H, D, D]      half   — final state per sequence (output)
+//   H0 [batch, H, D, D]      half   — optional initial state per sequence
 //   workspace [per-core scratch]     — Cube↔Vec communication buffer
 //
 // NPU memory hierarchy:
@@ -92,6 +93,14 @@
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 using namespace pto;
+
+#ifndef GDN_D
+#define GDN_D 128
+#endif
+
+#ifndef GDN_C
+#define GDN_C 128
+#endif
 
 #ifdef __CCE_AICORE__
 
@@ -285,15 +294,19 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 
 #endif
 
-template <int32_t NumHeads, int32_t NumKeyHeads, int32_t HiddenSize,
-          int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize>
 AICORE void chunk_h_kernel(
     __gm__ half *K_handle, __gm__ half *W_handle, __gm__ half *U_handle,
     __gm__ float *G_handle,
     __gm__ half *S_handle, __gm__ half *V_handle, __gm__ half *FS_handle,
+    __gm__ half *H0_handle,
+    int64_t has_initial_state,
+    int64_t output_final_state,
     __gm__ half *workspace_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
   // chunk_h advances the recurrent hidden state chunk by chunk:
@@ -323,14 +336,13 @@ AICORE void chunk_h_kernel(
 
   constexpr int32_t D = HiddenSize;
   constexpr int32_t C = ChunkSize;
-  constexpr int32_t H = NumHeads;
-  constexpr int32_t Hg = NumKeyHeads;
-  static_assert(Hg > 0 && H % Hg == 0,
-                "NumHeads must be divisible by NumKeyHeads");
-  constexpr int32_t GROUP = H / Hg;
+  const int32_t H = static_cast<int32_t>(num_heads);
+  const int32_t Hg = static_cast<int32_t>(num_key_heads);
+  if (H <= 0 || Hg <= 0 || (H % Hg) != 0) return;
+  const int32_t GROUP = H / Hg;
   constexpr int32_t HalfC = C / 2;
-  constexpr int32_t BSND_QKV_STRIDE = H * D;
-  constexpr int32_t BSND_K_STRIDE = Hg * D;
+  const int32_t BSND_QKV_STRIDE = H * D;
+  const int32_t BSND_K_STRIDE = Hg * D;
   constexpr int32_t DD = D * D;
 
   constexpr int32_t WS_WS = 0;
@@ -353,8 +365,8 @@ AICORE void chunk_h_kernel(
   TASSIGN(kv_l0, C * D * sizeof(float));
 
   constexpr int32_t G_BLOCK_UB = 0;
-  // Leading UB scratch: legacy kernels used ``C * NumHeads * sizeof(float)``, which overflows UB when
-  // ``NumHeads`` is 32/48/64. Keep the same slack as the historical ``GDN_H=16`` build (8192 bytes).
+  // Leading UB scratch: legacy kernels used ``C * H * sizeof(float)``, which overflows UB when
+  // Keep the same slack as the historical H=16 build (8192 bytes).
   constexpr int32_t ZERO_UB =
       ChunkSize * 16 * static_cast<int32_t>(sizeof(float));
   constexpr int32_t S_UB = ZERO_UB + 64 * sizeof(float);
@@ -563,10 +575,22 @@ AICORE void chunk_h_kernel(
     TEXPANDS(zero_ub, 0.0f);
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    // Start each sequence/head recurrence from S_0 = 0.
-    TEXPANDS(s_ub, 0.0f);
-
-    TCVT(s_ub_half, s_ub, pto::RoundMode::CAST_NONE);
+    if (has_initial_state != 0) {
+      int64_t h0_offset = (seq_idx * H + head) * DD + vid * HalfC * D;
+      GmShape2D h0_shape(HalfC, D);
+      GmStride2D h0_stride(D);
+      GmTensor2D<half> h0_global(H0_handle + h0_offset, h0_shape, h0_stride);
+      DynVecTile<half, HalfC, D> h0_load(HalfC, D);
+      TASSIGN(h0_load, S_UB_HALF);
+      TLOAD(h0_load, h0_global);
+      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      TCVT(s_ub, s_ub_half, pto::RoundMode::CAST_NONE);
+    } else {
+      // Start each sequence/head recurrence from S_0 = 0.
+      TEXPANDS(s_ub, 0.0f);
+      TCVT(s_ub_half, s_ub, pto::RoundMode::CAST_NONE);
+    }
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     {
@@ -579,6 +603,17 @@ AICORE void chunk_h_kernel(
       DynVecTile<half, HalfC, D> s_store(HalfC, D);
       TASSIGN(s_store, S_UB_HALF);
       TSTORE(s_global, s_store);
+    }
+    {
+      int64_t s_out_offset = (chunk_offset * H + head) * DD;
+      GmShape2D s_out_shape(HalfC, D);
+      GmStride2D s_out_stride(D);
+      GmTensor2D<half> s_out_global(
+          S_handle + s_out_offset + vid * HalfC * D, s_out_shape,
+          s_out_stride);
+      DynVecTile<half, HalfC, D> s_out_store(HalfC, D);
+      TASSIGN(s_out_store, S_UB_HALF);
+      TSTORE(s_out_global, s_out_store);
     }
     ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
 
@@ -837,8 +872,8 @@ AICORE void chunk_h_kernel(
           TSTORE(s_global, s_store);
         }
 
-        // Expose the post-chunk state so the next chunk (and debug/verification
-        // outputs) can see S_{i+1}. Conceptually:
+        // Expose the post-chunk state so the next chunk and output snapshot
+        // can see S_{i+1}. Conceptually:
         //   S_handle[chunk_idx + 1, head] = S_{i+1}
         int64_t s_out_offset = ((chunk_offset + ci + 1) * H + head) * DD;
         {
@@ -860,38 +895,41 @@ AICORE void chunk_h_kernel(
       }
     }
 
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    int64_t fs_offset = (seq_idx * H + head) * DD;
-    {
-      GmShape2D fs_shape(HalfC, D);
-      GmStride2D fs_stride(D);
-      GmTensor2D<half> fs_global(FS_handle + fs_offset + vid * HalfC * D,
-                                 fs_shape, fs_stride);
-      DynVecTile<half, HalfC, D> fs_store(HalfC, D);
-      TASSIGN(fs_store, S_UB_HALF);
-      TSTORE(fs_global, fs_store);
+    if (output_final_state != 0) {
+      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      int64_t fs_offset = (seq_idx * H + head) * DD;
+      {
+        GmShape2D fs_shape(HalfC, D);
+        GmStride2D fs_stride(D);
+        GmTensor2D<half> fs_global(FS_handle + fs_offset + vid * HalfC * D,
+                                   fs_shape, fs_stride);
+        DynVecTile<half, HalfC, D> fs_store(HalfC, D);
+        TASSIGN(fs_store, S_UB_HALF);
+        TSTORE(fs_global, fs_store);
+      }
+      set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
     }
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
   }
 #endif
 }
-
-#ifndef GDN_HG
-#define GDN_HG GDN_H
-#endif
 
 extern "C" __global__ AICORE void launch_chunk_h(
     __gm__ uint8_t *K, __gm__ uint8_t *W, __gm__ uint8_t *U,
     __gm__ uint8_t *G,
     __gm__ uint8_t *S, __gm__ uint8_t *V, __gm__ uint8_t *FS,
+    __gm__ uint8_t *H0,
+    int64_t has_initial_state,
+    int64_t output_final_state,
     __gm__ uint8_t *workspace,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
-  chunk_h_kernel<GDN_H, GDN_HG, GDN_D, GDN_C>(
+  chunk_h_kernel<GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(K),
       reinterpret_cast<__gm__ half *>(W),
       reinterpret_cast<__gm__ half *>(U),
@@ -899,23 +937,30 @@ extern "C" __global__ AICORE void launch_chunk_h(
       reinterpret_cast<__gm__ half *>(S),
       reinterpret_cast<__gm__ half *>(V),
       reinterpret_cast<__gm__ half *>(FS),
+      reinterpret_cast<__gm__ half *>(H0),
+      has_initial_state, output_final_state,
       reinterpret_cast<__gm__ half *>(workspace),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, ffts_addr);
+      batch_size, seq_len, total_tokens, num_heads, num_key_heads, ffts_addr);
 }
 
 extern "C" void call_kernel(
     uint32_t block_dim, void *stream,
     uint8_t *K, uint8_t *W, uint8_t *U, uint8_t *G,
     uint8_t *S, uint8_t *V, uint8_t *FS,
+    uint8_t *H0,
+    int64_t has_initial_state,
+    int64_t output_final_state,
     uint8_t *workspace,
     uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
+    uint32_t num_key_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
   rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
   launch_chunk_h<<<block_dim, nullptr, stream>>>(
-      K, W, U, G, S, V, FS, workspace, cu_seqlens,
-      batch_size, seq_len, total_tokens, fftsAddr);
+      K, W, U, G, S, V, FS, H0, has_initial_state, output_final_state, workspace, cu_seqlens,
+      batch_size, seq_len, total_tokens, num_heads, num_key_heads, fftsAddr);
 }

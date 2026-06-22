@@ -92,6 +92,7 @@ class RefGDN:
         g_cumsum: torch.Tensor,
         cs: int,
         cu_seqlens=None,
+        initial_state: torch.Tensor | None = None,
     ):
         """CPU reference for chunk_h: states S, v_new, final states."""
         B, T, Hg, Dd = k.shape
@@ -115,7 +116,10 @@ class RefGDN:
             nc = (eos - bos + cs - 1) // cs
             for h in range(H):
                 hg = h // grp
-                S = torch.zeros(Dd, Dd, dtype=self.dtype)
+                if initial_state is None:
+                    S = torch.zeros(Dd, Dd, dtype=self.dtype)
+                else:
+                    S = initial_state[si, h].to(self.dtype).clone()
                 for ci in range(nc):
                     s, e = bos + ci * cs, min(bos + (ci + 1) * cs, eos)
                     gc = gf[0, s:e, h]
@@ -218,7 +222,19 @@ class RefGDN:
         return o
 
     def run_full_pipeline(
-        self, q, k, v, g_in, beta, cu_seqlens_list, H, Hg, scale=1.0, C=128
+        self,
+        q,
+        k,
+        v,
+        g_in,
+        beta,
+        cu_seqlens_list,
+        H,
+        Hg,
+        scale=1.0,
+        C=128,
+        initial_state=None,
+        return_final_state=False,
     ):
         """Complete CPU fp32 reference for the GDN pipeline."""
         cu = cu_seqlens_list
@@ -226,7 +242,9 @@ class RefGDN:
         A = self.kkt(k, beta, g_sum, C, cu)
         A_inv = self.solve_tril(A, C, cu)
         w, u = self.wy_fast(k, v, beta, A_inv, g_sum, C, cu)
-        _, v_new, _ = self.chunk_h(k, w, u, g_sum, C, cu)
-        h_states, v_new, _ = self.chunk_h(k, w, u, g_sum, C, cu)
+        h_states, v_new, final_state = self.chunk_h(
+            k, w, u, g_sum, C, cu, initial_state=initial_state
+        )
         o = self.chunk_o(q, k, v_new, h_states, g_sum, C, cu)
-        return o * scale
+        out = o * scale
+        return (out, final_state) if return_final_state else out

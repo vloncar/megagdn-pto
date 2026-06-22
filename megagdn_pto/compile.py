@@ -77,13 +77,7 @@ except (RuntimeError, AssertionError):
 # Compilation helpers
 # ---------------------------------------------------------------------------
 
-def _common_flags(
-    *,
-    num_heads: int,
-    key_heads: int,
-    hidden_size: int,
-    chunk_size: int,
-) -> list[str]:
+def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
     """Return bisheng flags shared by all chunk-GDN kernels."""
     flags = [
         "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=gnu++17",
@@ -99,8 +93,6 @@ def _common_flags(
         f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc",
         f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/runtime",
         f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/profiling",
-        f"-DGDN_H={num_heads}",
-        f"-DGDN_HG={key_heads}",
         f"-DGDN_D={hidden_size}",
         f"-DGDN_C={chunk_size}",
     ]
@@ -122,23 +114,18 @@ def compile_chunk_kernel(
     cpp_basename: str,
     so_stem: str,
     *,
-    num_heads: int,
     hidden_size: int = 128,
     chunk_size: int = 128,
-    key_heads: int | None = None,
     cpp_mtime_ns: int = 0,
 ) -> str:
     """Compile a chunk-GDN kernel and return the path to the resulting ``.so``."""
-    kh = key_heads if key_heads is not None else num_heads
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, cpp_basename)
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"{so_stem}_H{num_heads}_Hg{kh}_D{hidden_size}_C{chunk_size}.so",
+        f"{so_stem}_D{hidden_size}_C{chunk_size}.so",
     )
-    flags = _common_flags(
-        num_heads=num_heads, key_heads=kh, hidden_size=hidden_size, chunk_size=chunk_size
-    )
+    flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=300)
     return lib_path
 
@@ -146,24 +133,19 @@ def compile_chunk_kernel(
 @lru_cache(maxsize=None)
 def compile_mega_kernel(
     *,
-    num_heads: int = 16,
-    key_heads: int | None = None,
     hidden_size: int = 128,
     chunk_size: int = 128,
     cpp_mtime_ns: int = 0,
 ) -> str:
     """Compile the fused mega-kernel and return the path to the resulting ``.so``."""
-    kh = key_heads if key_heads is not None else num_heads
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, "mega_kernel.cpp")
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"mega_kernel_H{num_heads}_Hg{kh}_D{hidden_size}_C{chunk_size}.so",
+        f"mega_kernel_D{hidden_size}_C{chunk_size}.so",
     )
-    flags = _common_flags(
-        num_heads=num_heads, key_heads=kh, hidden_size=hidden_size, chunk_size=chunk_size
-    )
-    print(f"[megagdn_pto] Compiling mega_kernel (H={num_heads} Hg={kh}) …")
+    flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
+    print("[megagdn_pto] Compiling mega_kernel …")
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=600)
     print(f"[megagdn_pto] Compiled → {lib_path}")
     return lib_path
@@ -206,6 +188,8 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, "tri_inverse.cpp")
     lib_path = os.path.join(_COMPILED_DIR, "tri_inverse_jit.so")
+    if os.path.exists(lib_path):
+        return lib_path
     flags = [
         "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=c++17",
         f"-I{_KERNEL_INCLUDE}",
