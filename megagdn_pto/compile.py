@@ -77,8 +77,22 @@ except (RuntimeError, AssertionError):
 # Compilation helpers
 # ---------------------------------------------------------------------------
 
-def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
-    """Return bisheng flags shared by all chunk-GDN kernels."""
+def _common_flags(
+    *,
+    hidden_size: int,
+    chunk_size: int,
+    num_heads: int | None = None,
+    key_heads: int | None = None,
+) -> list[str]:
+    """Return bisheng flags shared by all chunk kernels.
+
+    ``num_heads`` injects ``-DGDN_H`` for the KDA kernels, which template the
+    value/gate head count at compile time (``kkt_kda_kernel<GDN_H, …>``). The GDN
+    chunk kernels do not reference ``GDN_H`` and pass ``num_heads=None`` (no flag,
+    so their compile line is unchanged). ``key_heads`` is accepted for call-site
+    compatibility (``compile_mega_kernel_kda`` passes it) but no ``GDN_HG`` macro
+    exists — GVA expansion is done host-side before the kernels — so it is ignored.
+    """
     flags = [
         "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=gnu++17",
         "--cce-aicore-arch=dav-c220",
@@ -96,6 +110,8 @@ def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
         f"-DGDN_D={hidden_size}",
         f"-DGDN_C={chunk_size}",
     ]
+    if num_heads is not None:
+        flags.append(f"-DGDN_H={num_heads}")
     if os.path.isdir(_DRIVER_INC):
         flags.append(f"-I{_DRIVER_INC}")
     extra = os.environ.get("PTO_DYNAMIC_EXTRA_FLAGS", "").split()
@@ -116,16 +132,28 @@ def compile_chunk_kernel(
     *,
     hidden_size: int = 128,
     chunk_size: int = 128,
+    num_heads: int | None = None,
+    key_heads: int | None = None,
     cpp_mtime_ns: int = 0,
 ) -> str:
-    """Compile a chunk-GDN kernel and return the path to the resulting ``.so``."""
+    """Compile a chunk kernel and return the path to the resulting ``.so``.
+
+    ``num_heads`` (the KDA value/gate head count) is injected as ``-DGDN_H`` and
+    folded into the ``.so`` cache name so distinct HV variants don't collide. GDN
+    chunk kernels leave it ``None`` -> no ``-DGDN_H`` and the legacy
+    ``{stem}_D{D}_C{C}.so`` name, so their artifacts are unchanged.
+    """
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, cpp_basename)
+    head_tag = f"_H{num_heads}" if num_heads is not None else ""
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"{so_stem}_D{hidden_size}_C{chunk_size}.so",
+        f"{so_stem}{head_tag}_D{hidden_size}_C{chunk_size}.so",
     )
-    flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
+    flags = _common_flags(
+        hidden_size=hidden_size, chunk_size=chunk_size,
+        num_heads=num_heads, key_heads=key_heads,
+    )
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=300)
     return lib_path
 
