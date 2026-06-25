@@ -78,7 +78,7 @@ AICORE void cast_g_fp16_to_fp32(int32_t halfAddr, int32_t ubAddr)
   pipe_barrier(PIPE_V);
 }
 
-template <int32_t NumHeads, int32_t KDim, int32_t ChunkSize>
+template <int32_t KDim, int32_t ChunkSize>
 AICORE void gate_cumsum_kda_kernel(
     __gm__ half *g_ptr, __gm__ float *g_sum_ptr,
     __gm__ int32_t *cu_seqlens,
@@ -133,7 +133,8 @@ AICORE void gate_cumsum_kda_kernel(
   // chunk_h.cpp's per-head BSND loads at e.g. lines 599-604.
   using GmShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
   using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
-  using GmHalf = GlobalTensor<half, GmShape, GmStride>;
+  using GmHalf = GlobalTensor<half, GmShape, GmStride>;    // input g (fp16)
+  using GmFloat = GlobalTensor<float, GmShape, GmStride>;  // output g_sum (fp32)
   // Runtime row stride (RowWidth) shared by every g / g_sum GM view below.
   GmStride row_stride(RowWidth);
 
@@ -229,8 +230,8 @@ AICORE void gate_cumsum_kda_kernel(
           GmShape ss;
           ss.shape[3] = valid;
           ss.shape[4] = ColTile;
-          GmHalf gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss, row_stride);
-          UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC>
+          GmFloat gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss, row_stride);
+          UbND<float, ChunkSize, CTC, DYNAMIC, DYNAMIC>
               s_store(valid, ColTile);
           TASSIGN(s_store, SUbAddr);
           TSTORE(gs_gm, s_store);
@@ -321,8 +322,8 @@ AICORE void gate_cumsum_kda_kernel(
               GmShape ss;
               ss.shape[3] = valid;
               ss.shape[4] = ColTile;
-              GmHalf gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss, row_stride);
-              UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC>
+              GmFloat gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss, row_stride);
+              UbND<float, ChunkSize, CTC, DYNAMIC, DYNAMIC>
                   s_store(valid, ColTile);
               TASSIGN(s_store, SUbAddr);
               TSTORE(gs_gm, s_store);

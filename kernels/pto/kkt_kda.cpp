@@ -160,6 +160,17 @@ AICORE void kkt_kda_kernel(
                                    Stride<1, 1, 1, DYNAMIC, 1>>;
     using GmHalfWsIn = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
     using GmHalfWsOut = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
+    // Strict-lower mask [C, C]; read one column c as a [my_rows, 1] strip where
+    // the row dim steps down by ChunkSize and the single column is contiguous
+    // (innermost stride 1).  Independent of head count, so a compile-time stride.
+    using GmFloatMaskColRow = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
+
+#if defined(__DAV_C220_CUBE__)
+    // Cube does no compute here; it only participates in the entry/exit barriers
+    // so the Vec-side sync_all() handshakes complete.
+    sync_all();
+    sync_all();
+#endif
 
 #if defined(__DAV_C220_VEC__)
     set_mask_norm();
@@ -266,7 +277,7 @@ AICORE void kkt_kda_kernel(
                 GmShapeDyn gs;
                 gs.shape[3] = 1;
                 gs.shape[4] = my_rows;
-                GmHalf1 b_gm(beta_ptr + static_cast<int64_t>(head_idx) * total_tokens +
+                GmHalf_1 b_gm(beta_ptr + static_cast<int64_t>(head_idx) * total_tokens +
                                  my_first,
                              gs);
                 UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_ld(1, my_rows);
@@ -385,7 +396,10 @@ AICORE void kkt_kda_kernel(
                     GmShapeDyn gs;
                     gs.shape[3] = my_rows;
                     gs.shape[4] = 1;
-                    GmHalfLoutCol l_gm(L_out_ptr + l_off, gs);
+                    // Row (token) dim steps by NumHeads*ChunkSize — runtime now,
+                    // so supply the stride at construction (see GmHalfOut above).
+                    Stride<1, 1, 1, DYNAMIC, 1> l_stride(NumHeads * ChunkSize);
+                    GmHalfOut l_gm(L_out_ptr + l_off, gs, l_stride);
                     TSTORE(l_gm, col_h);
                 }
                 set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
