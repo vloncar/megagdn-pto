@@ -60,6 +60,15 @@ using namespace pto;
 #define GDN_C 128
 #endif
 
+// GDN_MAX_HEADS: compile-time ceiling on the value-head count. NumHeads is now a
+// RUNTIME argument (one .so serves every head count), but the UB tiles must still
+// be sized at compile time, so they are sized for the worst case HTC=align(MAX,8).
+// Any NumHeads <= GDN_MAX_HEADS works; the unused columns are zero-padded and ride
+// along the SIMD lanes harmlessly. Must match the host-side _MAX_HEADS guard.
+#ifndef GDN_MAX_HEADS
+#define GDN_MAX_HEADS 64
+#endif
+
 // ── Recurrent prefix-sum chain synchronization ──────────────────────────────
 // The recurrent chain alternates TADD(acc,acc,g_i) (Vec) and TMOV(s_i,acc) (Vec)
 // with TASSIGN address/descriptor setup on each row. TADD/TMOV lower to PIPE_V,
@@ -117,11 +126,12 @@ using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor,
                        RV, CV, pto::SLayout::NoneBox, 512, P>;
 #endif
 
-template <int32_t NumHeads, int32_t ChunkSize>
+template <int32_t ChunkSize>
 AICORE void cumsum_kernel(
     __gm__ float *g_ptr, __gm__ float *g_sum_ptr,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
+    int32_t NumHeads,
     uint64_t ffts_addr)
 {
   // get_block_idx(): Returns this AI core's index (0..block_num-1).
@@ -153,14 +163,14 @@ AICORE void cumsum_kernel(
   set_mask_norm();
   set_vector_mask(-1, -1);
 
-  // HeadTileCols: NumHeads rounded up to 8-element alignment (32B for float)
-  // HTC = NumHeads rounded up to nearest multiple of 8.
-  // Why? The Vec engine processes data in 32-byte granularity.
-  // For float (4 bytes), that's 8 elements per SIMD "word".
-  // Rounding up ensures every row is a whole number of SIMD words,
-  // avoiding partial-lane issues. The extra columns are zero-padded.
-  // Example: NumHeads=16 → HTC=16 (already aligned), NumHeads=13 → HTC=16.
-  constexpr int32_t HTC = ((NumHeads + 7) / 8) * 8;
+  // HeadTileCols: worst-case head count rounded up to 8-element alignment (32B
+  // for float). NumHeads is a runtime value, so the UB tiles are sized for the
+  // compile-time ceiling GDN_MAX_HEADS; the actual NumHeads columns are used and
+  // the padding columns (NumHeads..HTC) are zero-filled, so the prefix sum over
+  // them stays zero and only rides the SIMD lanes at no correctness cost.
+  // Why 8-alignment? The Vec engine processes data in 32-byte granularity;
+  // for float (4 bytes) that's 8 elements per SIMD "word".
+  constexpr int32_t HTC = ((GDN_MAX_HEADS + 7) / 8) * 8;
   constexpr int32_t BlockBytes = ChunkSize * HTC *
                                  static_cast<int32_t>(sizeof(float));
   constexpr int32_t RowBytes = HTC * static_cast<int32_t>(sizeof(float));
@@ -186,8 +196,10 @@ AICORE void cumsum_kernel(
   // This is equivalent to:
   //   g_gm = torch.as_strided(g_ptr, size=[valid, NumHeads], stride=[NumHeads, 1])
   using GmShape  = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
-  using GmStride = Stride<1, 1, 1, NumHeads, 1>;
+  using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
   using GmFloat  = GlobalTensor<float, GmShape, GmStride>;
+  // Runtime row pitch = NumHeads elements (BSND: token t at offset t*NumHeads).
+  GmStride g_stride(NumHeads);
 
   // Pre-assign row accumulator at fixed UB address
   // TASSIGN(tile, address): Binds a tile descriptor to a fixed byte address in UB.
@@ -224,7 +236,7 @@ AICORE void cumsum_kernel(
       // NumHeads up to the 8-aligned HTC) so downstream Vec ops see zeros.
       {
         GmShape gs; gs.shape[3] = valid; gs.shape[4] = NumHeads;
-        GmFloat g_gm(g_ptr + chunk_start * NumHeads, gs);
+        GmFloat g_gm(g_ptr + chunk_start * NumHeads, gs, g_stride);
         UbND<float, ChunkSize, HTC, DYNAMIC, DYNAMIC, PadValue::Zero>
             g_load(valid, NumHeads);
         TASSIGN(g_load, GUbAddr);
@@ -311,7 +323,7 @@ AICORE void cumsum_kernel(
 
       {
         GmShape ss; ss.shape[3] = valid; ss.shape[4] = NumHeads;
-        GmFloat gs_gm(g_sum_ptr + chunk_start * NumHeads, ss);
+        GmFloat gs_gm(g_sum_ptr + chunk_start * NumHeads, ss, g_stride);
         UbND<float, ChunkSize, HTC, DYNAMIC, DYNAMIC>
             s_store(valid, NumHeads);
         TASSIGN(s_store, SUbAddr);
@@ -350,7 +362,7 @@ AICORE void cumsum_kernel(
           // Load g chunk from GM → UB, zero-padded
           {
             GmShape gs; gs.shape[3] = valid; gs.shape[4] = NumHeads;
-            GmFloat g_gm(g_ptr + chunk_start * NumHeads, gs);
+            GmFloat g_gm(g_ptr + chunk_start * NumHeads, gs, g_stride);
             UbND<float, ChunkSize, HTC, DYNAMIC, DYNAMIC, PadValue::Zero>
                 g_load(valid, NumHeads);
             TASSIGN(g_load, GUbAddr);
@@ -407,7 +419,7 @@ AICORE void cumsum_kernel(
 
           {
             GmShape ss; ss.shape[3] = valid; ss.shape[4] = NumHeads;
-            GmFloat gs_gm(g_sum_ptr + chunk_start * NumHeads, ss);
+            GmFloat gs_gm(g_sum_ptr + chunk_start * NumHeads, ss, g_stride);
             UbND<float, ChunkSize, HTC, DYNAMIC, DYNAMIC>
                 s_store(valid, NumHeads);
             TASSIGN(s_store, SUbAddr);
@@ -435,26 +447,16 @@ extern "C" __global__ AICORE void launch_cumsum(
     uint32_t num_heads,
     uint64_t ffts_addr)
 {
-#define DISPATCH_CUMSUM_H(H)                                      \
-  case H:                                                         \
-    cumsum_kernel<H, GDN_C>(                                      \
-        reinterpret_cast<__gm__ float *>(g_ptr),                  \
-        reinterpret_cast<__gm__ float *>(g_sum_ptr),              \
-        reinterpret_cast<__gm__ int32_t *>(cu_seqlens),           \
-        batch_size, seq_len, ffts_addr);                          \
-    return
-
-  switch (num_heads) {
-    DISPATCH_CUMSUM_H(16);
-    DISPATCH_CUMSUM_H(24);
-    DISPATCH_CUMSUM_H(32);
-    DISPATCH_CUMSUM_H(48);
-    DISPATCH_CUMSUM_H(64);
-    default:
-      return;
+  // NumHeads is a runtime kernel argument (one .so serves every head count).
+  // Guard the compile-time UB ceiling; host also validates before launch.
+  if (num_heads == 0 || num_heads > GDN_MAX_HEADS) {
+    return;
   }
-
-#undef DISPATCH_CUMSUM_H
+  cumsum_kernel<GDN_C>(
+      reinterpret_cast<__gm__ float *>(g_ptr),
+      reinterpret_cast<__gm__ float *>(g_sum_ptr),
+      reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
+      batch_size, seq_len, static_cast<int32_t>(num_heads), ffts_addr);
 }
 
 // ── Host-side launcher (called from Python via ctypes) ────────────
